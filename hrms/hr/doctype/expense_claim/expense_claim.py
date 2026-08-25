@@ -186,9 +186,6 @@ class ExpenseClaim(AccountsController, PWANotificationsMixin):
 		self.db_set("approval_status", "Cancelled")
 
 	def before_submit(self):
-		if not self.payable_account and not self.is_paid:
-			frappe.throw(_("Payable Account is mandatory to submit an Expense Claim"))
-
 		self.validate_for_self_approval()
 
 	def publish_update(self):
@@ -248,8 +245,16 @@ class ExpenseClaim(AccountsController, PWANotificationsMixin):
 			).run()[0][0]
 
 			task.save()
-		elif self.project:
-			frappe.get_doc("Project", self.project).update_project()
+
+		for project in self.get_linked_projects():
+			frappe.get_doc("Project", project).update_project()
+
+	def get_linked_projects(self):
+		projects = set()
+		if self.project:
+			projects.add(self.project)
+		projects.update(expense.project for expense in self.expenses if expense.project)
+		return projects
 
 	def make_gl_entries(self, cancel=False):
 		if flt(self.total_sanctioned_amount) > 0:
@@ -540,9 +545,16 @@ class ExpenseClaim(AccountsController, PWANotificationsMixin):
 		precision = self.precision("total_advance_amount")
 
 		for d in self.get("advances"):
-			advance_employee = frappe.db.get_value("Employee Advance", d.employee_advance, "employee")
-			if self.employee != advance_employee:
+			advance_details = frappe.db.get_value(
+				"Employee Advance",
+				d.employee_advance,
+				["employee", "currency", "advance_account", "paid_amount"],
+				as_dict=True,
+			)
+			if not advance_details or self.employee != advance_details.employee:
 				frappe.throw(_("Selected employee advance is not of employee {}").format(self.employee))
+
+			validate_employee_advance_currency_and_account(self, d.employee_advance, advance_details)
 
 			self.round_floats_in(d)
 			if d.allocated_amount and flt(d.allocated_amount) > flt(
@@ -670,6 +682,72 @@ def get_expense_claim_account(expense_claim_type: str, company: str) -> dict:
 	return {"account": account}
 
 
+def validate_employee_advance_currency_and_account(
+	expense_claim: Document, employee_advance: str, advance_details: dict | None = None
+) -> None:
+	if advance_details is None:
+		advance_details = frappe.db.get_value(
+			"Employee Advance",
+			{"name": employee_advance, "employee": expense_claim.employee},
+			["currency", "advance_account", "paid_amount"],
+			as_dict=True,
+		)
+	if not advance_details:
+		return
+
+	if expense_claim.currency and advance_details.currency != expense_claim.currency:
+		frappe.throw(
+			_(
+				"Employee Advance {0} is in currency {1} and can only be claimed in an Expense Claim of the same currency. This Expense Claim is in {2}."
+			).format(
+				frappe.bold(employee_advance),
+				frappe.bold(advance_details.currency),
+				frappe.bold(expense_claim.currency),
+			)
+		)
+
+	paid_amount = flt(advance_details.paid_amount)
+	redo_payment_msg = _(
+		"Cancel the Payment Entry made against it, correct the advance account to be of type Receivable, and create a new Payment Entry."
+	)
+
+	account_type = frappe.db.get_value("Account", advance_details.advance_account, "account_type")
+	if account_type != "Receivable":
+		if paid_amount:
+			frappe.throw(
+				_(
+					"Employee Advance {0} is linked to account {1}, which is not of type Receivable. {2}"
+				).format(
+					frappe.bold(employee_advance),
+					frappe.bold(advance_details.advance_account),
+					redo_payment_msg,
+				)
+			)
+		frappe.throw(
+			_(
+				"Employee Advance {0} is linked to account {1}, which is not of type Receivable. Please correct the account type before making a payment against it."
+			).format(frappe.bold(employee_advance), frappe.bold(advance_details.advance_account))
+		)
+
+	# the account may have been switched back to Receivable after the payment was made
+	# while it was Payable, that entry is still recorded with a negative amount
+	if paid_amount and not frappe.db.exists(
+		"Advance Payment Ledger Entry",
+		{
+			"against_voucher_type": "Employee Advance",
+			"against_voucher_no": employee_advance,
+			"event": "Submit",
+			"delinked": 0,
+			"amount": (">", 0),
+		},
+	):
+		frappe.throw(
+			_(
+				"Employee Advance {0}'s payment does not match its Receivable account. This can happen if the account's type was changed after the payment was made. {1}"
+			).format(frappe.bold(employee_advance), redo_payment_msg)
+		)
+
+
 @frappe.whitelist()
 def get_advances(expense_claim: str | dict | Document, advance_id: str | None = None):
 	import json
@@ -677,6 +755,7 @@ def get_advances(expense_claim: str | dict | Document, advance_id: str | None = 
 	if isinstance(expense_claim, str):
 		expense_claim = frappe._dict(json.loads(expense_claim))
 	expense_claim_doc = frappe.get_doc(expense_claim)
+	frappe.has_permission("Employee", "read", expense_claim_doc.employee, throw=True)
 	expense_claim_doc.advances = []
 
 	advance = frappe.qb.DocType("Employee Advance")
@@ -698,12 +777,12 @@ def get_advances(expense_claim: str | dict | Document, advance_id: str | None = 
 			& (advance.paid_amount > 0)
 			& (advance.status.notin(["Claimed", "Returned", "Partly Claimed and Returned"]))
 		)
+		# advance can only be adjusted in its own currency
+		if expense_claim_doc.currency:
+			query = query.where(advance.currency == expense_claim_doc.currency)
 	else:
 		query = query.where((advance.name == advance_id) & (advance.employee == expense_claim_doc.employee))
-
-	# advance can only be adjusted in its own currency
-	if expense_claim_doc.currency:
-		query = query.where(advance.currency == expense_claim_doc.currency)
+		validate_employee_advance_currency_and_account(expense_claim_doc, advance_id)
 
 	advances = query.run(as_dict=True)
 
@@ -714,6 +793,7 @@ def get_advances(expense_claim: str | dict | Document, advance_id: str | None = 
 
 @frappe.whitelist()
 def get_expense_claim(employee_advance: str | dict) -> Document:
+	frappe.has_permission("Employee Advance", "read", employee_advance, throw=True)
 	if isinstance(employee_advance, str):
 		employee_advance = frappe.get_doc("Employee Advance", employee_advance)
 
@@ -747,6 +827,7 @@ def get_expense_claim_advances(expense_claim, employee_advance):
 			"against_voucher_no": employee_advance.name,
 			"event": "Submit",
 			"delinked": False,
+			"amount": [">", 0],
 		},
 		fields=["voucher_type", "voucher_no", "amount", "base_amount", "exchange_rate", "creation"],
 	)

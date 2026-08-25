@@ -357,6 +357,7 @@ class SalaryStructureAssignment(Document):
 		data.total_working_days = period_days
 		data.leave_without_pay = 0
 		data.absent_days = 0
+		data.unmarked_days = 0
 		return data
 
 	def _evaluate_component_table(self, rows, data: frappe._dict) -> list:
@@ -452,6 +453,7 @@ def get_assigned_salary_structure(employee, on_date):
 
 @frappe.whitelist()
 def get_employee_currency(employee: str) -> str:
+	frappe.has_permission("Employee", "read", employee, throw=True)
 	employee_currency = frappe.db.get_value("Salary Structure Assignment", {"employee": employee}, "currency")
 	if not employee_currency:
 		frappe.throw(
